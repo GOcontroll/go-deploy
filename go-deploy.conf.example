@@ -1,0 +1,8 @@
+[mqtt]
+broker = 136.144.208.208
+port = 28741
+
+[agent]
+serial_number = CHANGE_ME
+app_id = CHANGE_ME
+topic_prefix = gocontroll

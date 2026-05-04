@@ -1,0 +1,15 @@
+[Unit]
+Description=GOcontroll remote update agent
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/go-deploy
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=go-deploy
+
+[Install]
+WantedBy=multi-user.target

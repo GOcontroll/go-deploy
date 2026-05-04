@@ -1,0 +1,133 @@
+name: Build and publish go-deploy package
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read version from tag
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+
+      - name: Install build dependencies
+        run: sudo apt-get install -y dpkg-dev
+
+      - name: Build .deb
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.version.outputs.version }}"
+          PACKAGE=go-deploy
+          ARCH=all
+          BUILD="${RUNNER_TEMP}/${PACKAGE}_${VERSION}_${ARCH}"
+          DIST="${RUNNER_TEMP}/dist"
+
+          mkdir -p "${BUILD}/DEBIAN" \
+                   "${BUILD}/usr/local/bin" \
+                   "${BUILD}/lib/systemd/system" \
+                   "${BUILD}/etc/go-deploy" \
+                   "${DIST}"
+
+          # --- Script -------------------------------------------------------------
+          install -Dm755 go-deploy "${BUILD}/usr/local/bin/go-deploy"
+
+          # --- Systemd service ----------------------------------------------------
+          install -Dm644 go-deploy.service \
+            "${BUILD}/lib/systemd/system/go-deploy.service"
+
+          # --- Example config -----------------------------------------------------
+          install -Dm644 go-deploy.conf.example \
+            "${BUILD}/etc/go-deploy/go-deploy.conf.example"
+
+          # --- DEBIAN/control -----------------------------------------------------
+          cat > "${BUILD}/DEBIAN/control" << CONTROL
+          Package: ${PACKAGE}
+          Version: ${VERSION}
+          Architecture: ${ARCH}
+          Maintainer: GOcontroll B.V. <info@gocontroll.com>
+          Depends: python3 (>= 3.9), python3-paho-mqtt
+          Section: utils
+          Priority: optional
+          Homepage: https://gocontroll.com
+          Description: GOcontroll remote update agent
+           MQTT-driven agent that subscribes to update commands, downloads
+           firmware from signed URLs, verifies checksums and runs
+           post-install scripts on GOcontroll controllers.
+          CONTROL
+
+          # --- DEBIAN/conffiles ---------------------------------------------------
+          cat > "${BUILD}/DEBIAN/conffiles" << 'EOF'
+          /etc/go-deploy/go-deploy.conf.example
+          EOF
+
+          # --- DEBIAN/postinst ----------------------------------------------------
+          cat > "${BUILD}/DEBIAN/postinst" << 'EOF'
+          #!/bin/bash
+          set -e
+          case "$1" in
+              configure)
+                  systemctl daemon-reload
+                  systemctl enable go-deploy.service
+                  if [ -f /etc/go-deploy/go-deploy.conf ]; then
+                      systemctl restart go-deploy.service || true
+                  fi
+                  ;;
+          esac
+          EOF
+          chmod 755 "${BUILD}/DEBIAN/postinst"
+
+          # --- DEBIAN/prerm -------------------------------------------------------
+          cat > "${BUILD}/DEBIAN/prerm" << 'EOF'
+          #!/bin/bash
+          set -e
+          case "$1" in
+              remove|purge)
+                  systemctl stop go-deploy.service || true
+                  systemctl disable go-deploy.service || true
+                  ;;
+          esac
+          EOF
+          chmod 755 "${BUILD}/DEBIAN/prerm"
+
+          # --- DEBIAN/postrm ------------------------------------------------------
+          cat > "${BUILD}/DEBIAN/postrm" << 'EOF'
+          #!/bin/bash
+          set -e
+          case "$1" in
+              purge)
+                  systemctl daemon-reload || true
+                  ;;
+          esac
+          EOF
+          chmod 755 "${BUILD}/DEBIAN/postrm"
+
+          # --- Build --------------------------------------------------------------
+          dpkg-deb -Zxz --build --root-owner-group "${BUILD}" \
+            "${DIST}/${PACKAGE}_${VERSION}_${ARCH}.deb"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ runner.temp }}/dist/go-deploy_${{ steps.version.outputs.version }}_all.deb
+          generate_release_notes: true
+
+      - name: Trigger go-apt index rebuild
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.APT_DISPATCH_TOKEN }}
+          repository: GOcontroll/go-apt
+          event-type: rebuild-index
+          client-payload: |
+            {
+              "package": "go-deploy",
+              "version": "${{ steps.version.outputs.version }}",
+              "arch": "all",
+              "deb_url": "https://github.com/GOcontroll/go-deploy/releases/download/${{ github.ref_name }}/go-deploy_${{ steps.version.outputs.version }}_all.deb"
+            }

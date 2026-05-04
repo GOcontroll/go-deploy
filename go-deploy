@@ -1,0 +1,212 @@
+#!/usr/bin/env python3
+"""go-deploy — MQTT-driven update agent voor GOcontroll controllers."""
+
+import configparser
+import hashlib
+import json
+import logging
+import os
+import signal
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+import urllib.request
+from pathlib import Path
+
+import paho.mqtt.client as mqtt
+
+VERSION = "1.0.0"
+CONFIG_PATH = os.environ.get("GO_DEPLOY_CONFIG", "/etc/go-deploy/go-deploy.conf")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(levelname)s go-deploy: %(message)s",
+    stream=sys.stdout,
+)
+log = logging.getLogger("go-deploy")
+
+
+def load_config(path: str) -> configparser.ConfigParser:
+    cfg = configparser.ConfigParser()
+    cfg["mqtt"] = {"broker": "localhost", "port": "1883"}
+    cfg["agent"] = {"topic_prefix": "gocontroll"}
+    if not cfg.read(path):
+        log.error("Config niet gevonden: %s", path)
+        sys.exit(1)
+    for key in ("serial_number", "app_id"):
+        if not cfg.get("agent", key, fallback=""):
+            log.error("Verplicht veld ontbreekt in config: [agent] %s", key)
+            sys.exit(1)
+    return cfg
+
+
+def sha256_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def download_file(url: str, dest: str) -> None:
+    log.info("Downloading %s", url)
+    urllib.request.urlretrieve(url, dest)
+    log.info("Download klaar — %d bytes", os.path.getsize(dest))
+
+
+def install_update(payload: dict) -> tuple:
+    url = payload.get("download_url")
+    version = payload.get("version", "onbekend")
+    expected_sha256 = payload.get("sha256")
+
+    if not url:
+        return False, "download_url ontbreekt in MQTT payload"
+
+    with tempfile.TemporaryDirectory(prefix="go-deploy-") as work:
+        tarball = os.path.join(work, "update.tar.gz")
+
+        try:
+            download_file(url, tarball)
+        except Exception as exc:
+            return False, f"Download mislukt: {exc}"
+
+        if expected_sha256:
+            actual = sha256_file(tarball)
+            if actual != expected_sha256:
+                return False, (
+                    f"SHA256 verificatie mislukt — "
+                    f"verwacht={expected_sha256} ontvangen={actual}"
+                )
+            log.info("SHA256 verificatie OK")
+        else:
+            log.warning("Geen SHA256 in payload — verificatie overgeslagen")
+
+        try:
+            with tarfile.open(tarball, "r:gz") as tar:
+                tar.extractall(work)
+            log.info("Tarball uitgepakt")
+        except Exception as exc:
+            return False, f"Uitpakken mislukt: {exc}"
+
+        post_install = os.path.join(work, "files", "post-install.sh")
+        if os.path.isfile(post_install):
+            os.chmod(post_install, 0o755)
+            log.info("post-install.sh uitvoeren")
+            result = subprocess.run(
+                ["/bin/bash", post_install],
+                cwd=work,
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+            if result.stdout.strip():
+                log.info("post-install stdout:\n%s", result.stdout.strip())
+            if result.stderr.strip():
+                log.warning("post-install stderr:\n%s", result.stderr.strip())
+            if result.returncode != 0:
+                return False, f"post-install.sh afgebroken met exitcode {result.returncode}"
+        else:
+            log.warning("Geen post-install.sh in tarball — handmatige installatie vereist")
+
+    log.info("Update naar versie %s succesvol afgerond", version)
+    return True, ""
+
+
+class Agent:
+    def __init__(self, cfg: configparser.ConfigParser):
+        self.serial = cfg["agent"]["serial_number"].strip()
+        self.app_id = cfg["agent"]["app_id"].strip()
+        self.prefix = cfg["agent"].get("topic_prefix", "gocontroll").strip()
+        self.broker = cfg["mqtt"]["broker"].strip()
+        self.port = int(cfg["mqtt"].get("port", 1883))
+
+        self.cmd_topic = f"{self.prefix}/{self.serial}/cmd/update"
+        self.status_topic = f"{self.prefix}/{self.serial}/status/update"
+        self._busy = False
+
+        self.client = mqtt.Client(
+            client_id=f"go-deploy-{self.serial}",
+            protocol=mqtt.MQTTv311,
+            clean_session=True,
+        )
+        self.client.reconnect_delay_set(min_delay=5, max_delay=60)
+        self.client.on_connect = self._on_connect
+        self.client.on_disconnect = self._on_disconnect
+        self.client.on_message = self._on_message
+
+    def _on_connect(self, client, _ud, _flags, rc):
+        if rc == 0:
+            log.info("Verbonden met broker %s:%d", self.broker, self.port)
+            client.subscribe(self.cmd_topic, qos=1)
+            log.info("Gesubscribed op: %s", self.cmd_topic)
+        else:
+            log.error("Verbinding geweigerd door broker (rc=%d)", rc)
+
+    def _on_disconnect(self, _client, _ud, rc):
+        if rc != 0:
+            log.warning("Onverwacht verbroken (rc=%d) — herverbinden...", rc)
+
+    def _on_message(self, client, _ud, msg):
+        if self._busy:
+            log.warning("Update al bezig — inkomend bericht genegeerd")
+            return
+        self._busy = True
+        try:
+            payload = json.loads(msg.payload.decode("utf-8"))
+        except Exception as exc:
+            log.error("Kan MQTT payload niet parsen: %s", exc)
+            self._busy = False
+            return
+
+        version = payload.get("version", "onbekend")
+        log.info("Update opdracht ontvangen — versie=%s app_id=%s", version, self.app_id)
+
+        ok, error = install_update(payload)
+
+        status_payload = json.dumps({
+            "status": "success" if ok else "failed",
+            "version": version,
+            "app_id": self.app_id,
+            "agent_version": VERSION,
+            **({"error": error} if error else {}),
+        })
+        client.publish(self.status_topic, status_payload, qos=1, retain=False)
+
+        if ok:
+            log.info("Update geslaagd — versie %s geinstalleerd", version)
+        else:
+            log.error("Update mislukt — %s", error)
+
+        self._busy = False
+
+    def run(self):
+        log.info(
+            "go-deploy v%s gestart — serial=%s app_id=%s broker=%s:%d",
+            VERSION, self.serial, self.app_id, self.broker, self.port,
+        )
+
+        def _shutdown(sig, _frame):
+            log.info("Signaal %d ontvangen — afsluiten", sig)
+            self.client.loop_stop()
+            self.client.disconnect()
+            sys.exit(0)
+
+        signal.signal(signal.SIGTERM, _shutdown)
+        signal.signal(signal.SIGINT, _shutdown)
+
+        self.client.connect_async(self.broker, self.port, keepalive=60)
+        self.client.loop_start()
+
+        while True:
+            time.sleep(1)
+
+
+def main():
+    cfg = load_config(CONFIG_PATH)
+    Agent(cfg).run()
+
+
+if __name__ == "__main__":
+    main()
