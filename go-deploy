@@ -18,8 +18,9 @@ from pathlib import Path
 
 import paho.mqtt.client as mqtt
 
-VERSION = "1.2.1"
+VERSION = "1.3.0"
 CONFIG_PATH = os.environ.get("GO_DEPLOY_CONFIG", "/etc/go-deploy/go-deploy.conf")
+APP_STATE_FILE = "/etc/go-deploy/current-app.json"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -41,6 +42,23 @@ def load_config(path: str) -> configparser.ConfigParser:
             log.error("Verplicht veld ontbreekt in config: [agent] %s", key)
             sys.exit(1)
     return cfg
+
+
+def read_app_state() -> dict:
+    try:
+        with open(APP_STATE_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def write_app_state(version: str, app_id: str) -> None:
+    try:
+        os.makedirs(os.path.dirname(APP_STATE_FILE), exist_ok=True)
+        with open(APP_STATE_FILE, "w") as f:
+            json.dump({"version": version, "app_id": app_id}, f)
+    except Exception as exc:
+        log.warning("Kan app state niet opslaan: %s", exc)
 
 
 def sha256_file(path: str) -> str:
@@ -149,6 +167,16 @@ class Agent:
             log.info("Verbonden met broker %s:%d", self.broker, self.port)
             client.subscribe([(self.cmd_topic, 1), (self.cmd_tunnel_topic, 1)])
             log.info("Gesubscribed op: %s en %s", self.cmd_topic, self.cmd_tunnel_topic)
+            state = read_app_state()
+            if state.get("version"):
+                pub = json.dumps({
+                    "status": "running",
+                    "version": state["version"],
+                    "app_id": state.get("app_id", self.app_id),
+                    "agent_version": VERSION,
+                })
+                client.publish(self.status_topic, pub, qos=1, retain=True)
+                log.info("Geinstalleerde versie gepubliceerd: %s", state["version"])
         else:
             log.error("Verbinding geweigerd door broker (rc=%d)", rc)
 
@@ -228,9 +256,10 @@ class Agent:
             "agent_version": VERSION,
             **({"error": error} if error else {}),
         })
-        client.publish(self.status_topic, status_payload, qos=1, retain=False)
+        client.publish(self.status_topic, status_payload, qos=1, retain=True)
 
         if ok:
+            write_app_state(version, self.app_id)
             log.info("Update geslaagd — versie %s geinstalleerd", version)
         else:
             log.error("Update mislukt — %s", error)
