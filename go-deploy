@@ -11,13 +11,14 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import time
 import urllib.request
 from pathlib import Path
 
 import paho.mqtt.client as mqtt
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 CONFIG_PATH = os.environ.get("GO_DEPLOY_CONFIG", "/etc/go-deploy/go-deploy.conf")
 
 logging.basicConfig(
@@ -124,9 +125,12 @@ class Agent:
         self.username = cfg["mqtt"].get("username", "").strip() or None
         self.password = cfg["mqtt"].get("password", "").strip() or None
 
-        self.cmd_topic = f"{self.prefix}/{self.serial}/cmd/update"
-        self.status_topic = f"{self.prefix}/{self.serial}/status/update"
+        self.cmd_topic        = f"{self.prefix}/{self.serial}/cmd/update"
+        self.status_topic     = f"{self.prefix}/{self.serial}/status/update"
+        self.cmd_tunnel_topic    = f"{self.prefix}/{self.serial}/cmd/tunnel"
+        self.status_tunnel_topic = f"{self.prefix}/{self.serial}/status/tunnel"
         self._busy = False
+        self._tunnel_timer: threading.Timer | None = None
 
         self.client = mqtt.Client(
             client_id=f"go-deploy-{self.serial}",
@@ -143,8 +147,8 @@ class Agent:
     def _on_connect(self, client, _ud, _flags, rc):
         if rc == 0:
             log.info("Verbonden met broker %s:%d", self.broker, self.port)
-            client.subscribe(self.cmd_topic, qos=1)
-            log.info("Gesubscribed op: %s", self.cmd_topic)
+            client.subscribe([(self.cmd_topic, 1), (self.cmd_tunnel_topic, 1)])
+            log.info("Gesubscribed op: %s en %s", self.cmd_topic, self.cmd_tunnel_topic)
         else:
             log.error("Verbinding geweigerd door broker (rc=%d)", rc)
 
@@ -153,6 +157,47 @@ class Agent:
             log.warning("Onverwacht verbroken (rc=%d) — herverbinden...", rc)
 
     def _on_message(self, client, _ud, msg):
+        if msg.topic == self.cmd_tunnel_topic:
+            self._handle_tunnel(client, msg)
+        else:
+            self._handle_update(client, msg)
+
+    def _handle_tunnel(self, client, msg):
+        try:
+            payload = json.loads(msg.payload.decode("utf-8"))
+        except Exception as exc:
+            log.error("Kan tunnel payload niet parsen: %s", exc)
+            return
+        duration = int(payload.get("duration", 3600))
+        log.info("Tunnel opdracht ontvangen — %d seconden", duration)
+
+        if self._tunnel_timer is not None:
+            self._tunnel_timer.cancel()
+            self._tunnel_timer = None
+
+        result = subprocess.run(["systemctl", "start", "cloudflared"], capture_output=True)
+        if result.returncode != 0:
+            log.error("cloudflared starten mislukt: %s", result.stderr.decode())
+            client.publish(self.status_tunnel_topic,
+                json.dumps({"status": "error", "error": "start failed"}), qos=1)
+            return
+
+        log.info("cloudflared gestart, stopt over %d seconden", duration)
+        client.publish(self.status_tunnel_topic,
+            json.dumps({"status": "active", "duration": duration}), qos=1)
+
+        def stop_tunnel():
+            log.info("Tunnel timeout — cloudflared stoppen")
+            subprocess.run(["systemctl", "stop", "cloudflared"], capture_output=True)
+            client.publish(self.status_tunnel_topic,
+                json.dumps({"status": "stopped"}), qos=1)
+            self._tunnel_timer = None
+
+        self._tunnel_timer = threading.Timer(duration, stop_tunnel)
+        self._tunnel_timer.daemon = True
+        self._tunnel_timer.start()
+
+    def _handle_update(self, client, msg):
         if self._busy:
             log.warning("Update al bezig — inkomend bericht genegeerd")
             return
