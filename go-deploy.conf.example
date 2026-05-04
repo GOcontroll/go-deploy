@@ -1,6 +1,8 @@
 [mqtt]
 broker = 136.144.208.208
 port = 28741
+username = CHANGE_ME
+password = CHANGE_ME
 
 [agent]
 serial_number = CHANGE_ME
