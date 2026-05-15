@@ -2,10 +2,13 @@
 """go-deploy — MQTT-driven update agent voor GOcontroll controllers."""
 
 import configparser
+import grp
 import hashlib
 import json
 import logging
 import os
+import pwd
+import shutil
 import signal
 import subprocess
 import sys
@@ -18,7 +21,7 @@ from pathlib import Path
 
 import paho.mqtt.client as mqtt
 
-VERSION = "1.3.2"
+VERSION = "1.4.0"
 CONFIG_PATH = os.environ.get("GO_DEPLOY_CONFIG", "/etc/go-deploy/go-deploy.conf")
 APP_STATE_FILE = "/etc/go-deploy/current-app.json"
 
@@ -84,6 +87,61 @@ def download_file(url: str, dest: str) -> None:
     log.info("Download klaar — %d bytes", os.path.getsize(dest))
 
 
+def _place_files_from_manifest(work: str, files_spec: list) -> tuple:
+    """Plaats elke entry uit het versie-manifest op de juiste pad-bestemming.
+
+    Per entry: SHA256 verifieren (als opgegeven), doel-directory aanmaken, atomic
+    via tmp + os.replace, daarna chmod en chown. Faalt hard zodra één file mist
+    of niet geverifieerd kan worden — partial installs zijn een grotere bron van
+    bugs dan een geweigerde update.
+    """
+    for spec in files_spec:
+        src_rel = spec.get("source") or ""
+        dst = spec.get("destination") or ""
+        if not src_rel or not dst:
+            return False, f"manifest-entry mist source/destination: {spec!r}"
+        src = os.path.join(work, src_rel)
+        if not os.path.isfile(src):
+            return False, f"file ontbreekt in tarball: {src_rel}"
+        expected_sha = spec.get("sha256")
+        if expected_sha:
+            actual = sha256_file(src)
+            if actual != expected_sha:
+                return False, f"SHA256 mismatch op {src_rel}: verwacht={expected_sha} ontvangen={actual}"
+        try:
+            os.makedirs(os.path.dirname(dst) or "/", exist_ok=True)
+        except OSError as exc:
+            return False, f"kan doel-directory niet aanmaken voor {dst}: {exc}"
+        tmp_dst = dst + ".go-deploy.tmp"
+        try:
+            shutil.copyfile(src, tmp_dst)
+        except OSError as exc:
+            return False, f"copy naar {tmp_dst} mislukt: {exc}"
+        mode_str = spec.get("mode")
+        if mode_str:
+            try:
+                os.chmod(tmp_dst, int(str(mode_str), 8))
+            except (ValueError, OSError) as exc:
+                log.warning("chmod %s op %s mislukt: %s", mode_str, tmp_dst, exc)
+        owner = spec.get("owner")
+        group = spec.get("group")
+        if owner or group:
+            try:
+                uid = pwd.getpwnam(owner).pw_uid if owner else -1
+                gid = grp.getgrnam(group).gr_gid if group else -1
+                os.chown(tmp_dst, uid, gid)
+            except (KeyError, PermissionError, OSError) as exc:
+                log.warning("chown %s:%s op %s mislukt: %s", owner, group, tmp_dst, exc)
+        try:
+            os.replace(tmp_dst, dst)
+        except OSError as exc:
+            try: os.remove(tmp_dst)
+            except OSError: pass
+            return False, f"atomic replace naar {dst} mislukt: {exc}"
+        log.info("Geplaatst: %s → %s", src_rel, dst)
+    return True, ""
+
+
 def install_update(payload: dict) -> tuple:
     url = payload.get("download_url")
     version = payload.get("version", "onbekend")
@@ -117,6 +175,19 @@ def install_update(payload: dict) -> tuple:
             log.info("Tarball uitgepakt")
         except Exception as exc:
             return False, f"Uitpakken mislukt: {exc}"
+
+        # Plaats files volgens het versie-manifest dat de Worker in payload.files
+        # heeft meegestuurd. Zonder deze stap blijft de tarball uitsluitend
+        # post-install.sh draaien en komen artefacten als /usr/simulink/*.elf nooit
+        # op hun bestemming (zie docs/update-flow.md voor het ontwerp).
+        manifest_files = payload.get("files") or []
+        if manifest_files:
+            ok, err_msg = _place_files_from_manifest(work, manifest_files)
+            if not ok:
+                return False, err_msg
+            log.info("Files geplaatst volgens manifest: %d", len(manifest_files))
+        else:
+            log.info("Geen files-mapping in payload — alleen post-install.sh wordt uitgevoerd")
 
         post_install = os.path.join(work, "files", "post-install.sh")
         if os.path.isfile(post_install):
