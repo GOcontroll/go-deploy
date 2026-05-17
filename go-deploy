@@ -21,7 +21,7 @@ from pathlib import Path
 
 import paho.mqtt.client as mqtt
 
-VERSION = "1.4.1"
+VERSION = "1.4.2"
 CONFIG_PATH = os.environ.get("GO_DEPLOY_CONFIG", "/etc/go-deploy/go-deploy.conf")
 APP_STATE_FILE = "/etc/go-deploy/current-app.json"
 
@@ -72,22 +72,38 @@ def sha256_file(path: str) -> str:
     return h.hexdigest()
 
 
-def _wait_for_plausible_clock(timeout: float = 300.0, poll: float = 5.0) -> bool:
-    """Wacht tot de systeemklok plausibel is (na 2025) of timeout verstrijkt.
+def _ntp_synchronized() -> bool:
+    """Vraag systemd of de klok daadwerkelijk via NTP gesynchroniseerd is.
 
-    Bedoeld voor controllers zonder RTC: na boot kan de klok in de jaren '70 staan
-    waardoor TLS-certificaten als 'not yet valid' worden geweigerd. NTP-sync via
-    systemd-timesyncd zet de klok meestal binnen seconden goed zodra het netwerk
-    bereikbaar is. Een bounded wait — niet oneindig — zodat een eerste-provisie
-    update zonder bereikbare NTP gewoon faalt en de worker kan retryen.
+    Werkt voor elke time-sync backend (timesyncd, chrony, ntpd) — `timedatectl`
+    rapporteert de geconsolideerde status. Faalt veilig met False als het
+    commando niet bestaat of een onverwachte waarde teruggeeft.
     """
-    plausible_epoch = 1735689600  # 2025-01-01 UTC
+    try:
+        result = subprocess.run(
+            ["timedatectl", "show", "--property=NTPSynchronized", "--value"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0 and result.stdout.strip().lower() == "yes"
+
+
+def _wait_for_ntp_sync(timeout: float = 300.0, poll: float = 3.0) -> bool:
+    """Wacht tot de klok via NTP gesynchroniseerd is, of timeout verstrijkt.
+
+    Vervangt de oude "klok > 2025-01-01" plausibility-check die te lax was: een
+    RTC-cached waarde kan ná 2025 staan maar vóór de NotBefore van het server
+    certificaat. We wachten nu op daadwerkelijke NTP-sync (zie _ntp_synchronized).
+    Bounded wait — zodat een eerste-provisie zonder bereikbare NTP gewoon faalt
+    en de worker kan retryen i.p.v. oneindig hangen.
+    """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if time.time() >= plausible_epoch:
+        if _ntp_synchronized():
             return True
         time.sleep(poll)
-    return time.time() >= plausible_epoch
+    return _ntp_synchronized()
 
 
 def _is_cert_not_yet_valid(exc: BaseException) -> bool:
@@ -107,9 +123,10 @@ def download_file(url: str, dest: str) -> None:
         if not _is_cert_not_yet_valid(exc):
             raise
         log.warning("TLS-cert 'not yet valid' — systeemklok loopt achter. Wachten op NTP-sync...")
-        if not _wait_for_plausible_clock():
+        if not _wait_for_ntp_sync():
+            log.error("NTP-sync niet bereikt binnen timeout — update afbreken")
             raise
-        log.info("Klok plausibel — download opnieuw proberen")
+        log.info("NTP-sync bevestigd — download opnieuw proberen")
         _do_download(req, dest)
     log.info("Download klaar — %d bytes", os.path.getsize(dest))
 
