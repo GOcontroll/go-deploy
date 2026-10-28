@@ -2,6 +2,11 @@
 Description=GOcontroll remote update agent
 After=network.target time-sync.target
 Wants=time-sync.target
+# Zonder config stopt go-deploy direct met exit 1, en Restart=always zou hem
+# dan op een nooit geprovisionde controller eindeloos elke 10 s herstarten.
+# Het install_script schrijft eerst de config en doet daarna systemctl restart;
+# dat toetst deze conditie opnieuw.
+ConditionPathExists=/etc/go-deploy/go-deploy.conf
 
 [Service]
 Type=simple

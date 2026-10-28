@@ -21,7 +21,7 @@ from pathlib import Path
 
 import paho.mqtt.client as mqtt
 
-VERSION = "1.4.2"
+VERSION = "1.4.3"
 CONFIG_PATH = os.environ.get("GO_DEPLOY_CONFIG", "/etc/go-deploy/go-deploy.conf")
 APP_STATE_FILE = "/etc/go-deploy/current-app.json"
 

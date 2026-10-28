@@ -77,6 +77,11 @@ jobs:
                   systemctl enable go-deploy.service
                   if [ -f /etc/go-deploy/go-deploy.conf ]; then
                       systemctl restart go-deploy.service || true
+                  else
+                      # Een versie van vóór ConditionPathExists kan nog in de
+                      # herstartlus zitten; een auto-restart toetst de
+                      # conditie niet opnieuw, dus de lus stopt pas hier.
+                      systemctl stop go-deploy.service || true
                   fi
                   ;;
           esac
