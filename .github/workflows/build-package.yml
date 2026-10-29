@@ -74,9 +74,19 @@ jobs:
           case "$1" in
               configure)
                   systemctl daemon-reload
-                  systemctl enable go-deploy.service
+                  # Alleen bij een eerste installatie ($2, de vorige
+                  # geconfigureerde versie, is leeg) aanzetten en starten. Bij
+                  # een update houdt de service zijn toestand: uit blijft uit,
+                  # en alleen een draaiende service wordt herstart.
+                  if [ -z "$2" ]; then
+                      systemctl enable go-deploy.service
+                  fi
                   if [ -f /etc/go-deploy/go-deploy.conf ]; then
-                      systemctl restart go-deploy.service || true
+                      if [ -z "$2" ]; then
+                          systemctl restart go-deploy.service || true
+                      else
+                          systemctl try-restart go-deploy.service || true
+                      fi
                   else
                       # Een versie van vóór ConditionPathExists kan nog in de
                       # herstartlus zitten; een auto-restart toetst de
@@ -94,8 +104,9 @@ jobs:
           set -e
           case "$1" in
               remove|purge)
+                  # Alleen stoppen. De enable-links blijven tot purge staan,
+                  # zodat een herinstallatie na remove dezelfde toestand krijgt.
                   systemctl stop go-deploy.service || true
-                  systemctl disable go-deploy.service || true
                   ;;
           esac
           EOF
@@ -107,6 +118,8 @@ jobs:
           set -e
           case "$1" in
               purge)
+                  find /etc/systemd/system -type l -path '*.wants/*' \
+                      -name go-deploy.service -delete 2>/dev/null || true
                   systemctl daemon-reload || true
                   ;;
           esac
