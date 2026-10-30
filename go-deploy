@@ -21,7 +21,8 @@ from pathlib import Path
 
 import paho.mqtt.client as mqtt
 
-VERSION = "1.4.4"
+VERSION = "1.4.5"
+TUNNEL_DEFAULT_DURATION = 3600  # veiligheidstimer voor een tunnel die zonder timer draait
 CONFIG_PATH = os.environ.get("GO_DEPLOY_CONFIG", "/etc/go-deploy/go-deploy.conf")
 APP_STATE_FILE = "/etc/go-deploy/current-app.json"
 
@@ -282,6 +283,7 @@ class Agent:
         self.status_tunnel_topic = f"{self.prefix}/{self.serial}/status/tunnel"
         self._busy = False
         self._tunnel_timer: threading.Timer | None = None
+        self._tunnel_deadline: float | None = None
 
         self.client = mqtt.Client(
             client_id=f"go-deploy-{self.serial}",
@@ -310,6 +312,7 @@ class Agent:
                 })
                 client.publish(self.status_topic, pub, qos=1, retain=True)
                 log.info("Geinstalleerde versie gepubliceerd: %s", state["version"])
+            self._sync_tunnel_state(client)
         else:
             log.error("Verbinding geweigerd door broker (rc=%d)", rc)
 
@@ -345,6 +348,50 @@ class Agent:
         except Exception as exc:
             log.error("Stop cloudflared mislukt: %s", exc)
 
+    def _cancel_tunnel_timer(self) -> None:
+        if self._tunnel_timer is not None:
+            self._tunnel_timer.cancel()
+            self._tunnel_timer = None
+        self._tunnel_deadline = None
+
+    def _arm_tunnel_timer(self, client, duration: int) -> None:
+        def stop_tunnel():
+            log.info("Tunnel timeout — cloudflared stoppen")
+            self._stop_cloudflared()
+            client.publish(self.status_tunnel_topic,
+                json.dumps({"status": "stopped"}), qos=1)
+            self._tunnel_timer = None
+            self._tunnel_deadline = None
+
+        self._tunnel_deadline = time.monotonic() + duration
+        self._tunnel_timer = threading.Timer(duration, stop_tunnel)
+        self._tunnel_timer.daemon = True
+        self._tunnel_timer.start()
+
+    def _sync_tunnel_state(self, client) -> None:
+        """Meld de echte tunnelstatus na (her)verbinden.
+
+        Een stopopdracht tijdens een verbindingsbreuk gaat verloren (geen retain,
+        clean_session), terwijl de Worker de knop dan al heeft uitgezet. Deze melding
+        trekt de dashboardstatus weer gelijk met wat er op de controller draait.
+        """
+        active = subprocess.run(
+            ["systemctl", "is-active", "--quiet", "cloudflared"],
+            capture_output=True,
+        ).returncode == 0
+        if not active:
+            self._cancel_tunnel_timer()
+            client.publish(self.status_tunnel_topic,
+                json.dumps({"status": "stopped"}), qos=1)
+            return
+        if self._tunnel_timer is None:
+            log.warning("cloudflared draait zonder timer — stopt over %d seconden",
+                        TUNNEL_DEFAULT_DURATION)
+            self._arm_tunnel_timer(client, TUNNEL_DEFAULT_DURATION)
+        remaining = max(1, int(self._tunnel_deadline - time.monotonic()))
+        client.publish(self.status_tunnel_topic,
+            json.dumps({"status": "active", "duration": remaining}), qos=1)
+
     def _handle_tunnel(self, client, msg):
         try:
             payload = json.loads(msg.payload.decode("utf-8"))
@@ -354,9 +401,7 @@ class Agent:
         duration = int(payload.get("duration", 3600))
         log.info("Tunnel opdracht ontvangen — %d seconden", duration)
 
-        if self._tunnel_timer is not None:
-            self._tunnel_timer.cancel()
-            self._tunnel_timer = None
+        self._cancel_tunnel_timer()
 
         if duration == 0:
             log.info("Stop commando ontvangen — cloudflared stoppen")
@@ -368,6 +413,8 @@ class Agent:
         result = subprocess.run(["systemctl", "start", "cloudflared"], capture_output=True)
         if result.returncode != 0:
             log.error("cloudflared starten mislukt: %s", result.stderr.decode())
+            # Restart=on-failure blijft anders herstarten: tunnel actief, knop uit, geen timer.
+            self._stop_cloudflared()
             client.publish(self.status_tunnel_topic,
                 json.dumps({"status": "error", "error": "start failed"}), qos=1)
             return
@@ -375,17 +422,7 @@ class Agent:
         log.info("cloudflared gestart, stopt over %d seconden", duration)
         client.publish(self.status_tunnel_topic,
             json.dumps({"status": "active", "duration": duration}), qos=1)
-
-        def stop_tunnel():
-            log.info("Tunnel timeout — cloudflared stoppen")
-            self._stop_cloudflared()
-            client.publish(self.status_tunnel_topic,
-                json.dumps({"status": "stopped"}), qos=1)
-            self._tunnel_timer = None
-
-        self._tunnel_timer = threading.Timer(duration, stop_tunnel)
-        self._tunnel_timer.daemon = True
-        self._tunnel_timer.start()
+        self._arm_tunnel_timer(client, duration)
 
     def _handle_update(self, client, msg):
         if self._busy:
